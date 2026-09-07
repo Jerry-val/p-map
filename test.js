@@ -563,6 +563,369 @@ test('pMapIterable - empty', async t => {
 	t.deepEqual(await collectAsyncIterable(pMapIterable([], mapper)), []);
 });
 
+for (const asyncSource of [false, true]) {
+	test(`pMapIterable - cleanup on early break (${asyncSource ? 'async' : 'sync'} source)`, async t => {
+		let closed = false;
+		function * source() {
+			try {
+				yield 1;
+				yield 2;
+				yield 3;
+			} finally {
+				closed = true;
+			}
+		}
+
+		const iterable = asyncSource ? (async function * () {
+			yield * source();
+		})() : source();
+
+		// Exercise IteratorClose through an actual for-await break.
+		// eslint-disable-next-line no-unreachable-loop
+		for await (const value of pMapIterable(iterable, value => value, {concurrency: 1})) {
+			t.is(value, 1);
+			break;
+		}
+
+		t.true(closed);
+	});
+}
+
+test('pMapIterable - cleanup after a mapper error preserves the original error', async t => {
+	const mapperError = new Error('mapper failed');
+	let closed = false;
+	async function * source() {
+		try {
+			yield 1;
+			yield 2;
+		} finally {
+			closed = true;
+			throw new Error('cleanup failed'); // eslint-disable-line no-unsafe-finally
+		}
+	}
+
+	await t.throwsAsync(collectAsyncIterable(pMapIterable(source(), () => {
+		throw mapperError;
+	}, {concurrency: 1})), {is: mapperError});
+	t.true(closed);
+});
+
+test('pMapIterable - cleanup errors are reported on early return', async t => {
+	const cleanupError = new Error('cleanup failed');
+	function * source() {
+		try {
+			yield 1;
+			yield 2;
+			yield 3;
+		} finally {
+			throw cleanupError; // eslint-disable-line no-unsafe-finally
+		}
+	}
+
+	const iterator = pMapIterable(source(), value => value, {concurrency: 1})[Symbol.asyncIterator]();
+	await iterator.next();
+	await t.throwsAsync(iterator.return(), {is: cleanupError});
+});
+
+test('pMapIterable - cleanup is awaited on early return', async t => {
+	let finishCleanup;
+	const cleanup = new Promise(resolve => {
+		finishCleanup = resolve;
+	});
+	let closed = false;
+	async function * source() {
+		try {
+			yield 1;
+			yield 2;
+			yield 3;
+		} finally {
+			await cleanup;
+			closed = true;
+		}
+	}
+
+	const iterator = pMapIterable(source(), value => value, {concurrency: 1})[Symbol.asyncIterator]();
+	await iterator.next();
+	let returned = false;
+	const closing = iterator.return().then(() => {
+		returned = true;
+	});
+
+	await delay(0);
+	t.false(returned);
+	finishCleanup();
+	await closing;
+	t.true(closed);
+});
+
+test('pMapIterable - cleanup awaits the return value of a sync source', async t => {
+	let finishCleanup;
+	const cleanup = new Promise(resolve => {
+		finishCleanup = resolve;
+	});
+	function * source() {
+		try {
+			yield 1;
+			yield 2;
+			yield 3;
+		} finally {
+			return cleanup; // eslint-disable-line no-unsafe-finally
+		}
+	}
+
+	const iterator = pMapIterable(source(), value => value, {concurrency: 1})[Symbol.asyncIterator]();
+	await iterator.next();
+	let returned = false;
+	const closing = iterator.return().then(() => {
+		returned = true;
+	});
+
+	await delay(0);
+	t.false(returned);
+	finishCleanup();
+	await closing;
+	t.true(returned);
+});
+
+for (const mapperFails of [false, true]) {
+	test(`pMapIterable - cleanup handles a rejected sync return value (${mapperFails ? 'mapper error' : 'early return'})`, async t => {
+		const mapperError = new Error('mapper failed');
+		const cleanupError = new Error('cleanup failed');
+		function * source() {
+			try {
+				yield 1;
+				yield 2;
+				yield 3;
+			} finally {
+				return Promise.reject(cleanupError); // eslint-disable-line no-unsafe-finally
+			}
+		}
+
+		const iterator = pMapIterable(source(), value => {
+			if (mapperFails) {
+				throw mapperError;
+			}
+
+			return value;
+		}, {concurrency: 1})[Symbol.asyncIterator]();
+
+		if (mapperFails) {
+			await t.throwsAsync(iterator.next(), {is: mapperError});
+		} else {
+			await iterator.next();
+			await t.throwsAsync(iterator.return(), {is: cleanupError});
+		}
+	});
+}
+
+for (const outcome of ['value', 'next rejection', 'value rejection']) {
+	test(`pMapIterable - cleanup stops mapping an in-flight ${outcome}`, async t => {
+		let resolveNext;
+		let rejectNext;
+		const pendingNext = new Promise((resolve, reject) => {
+			resolveNext = resolve;
+			rejectNext = reject;
+		});
+		let nextCalls = 0;
+		let returnCalls = 0;
+		const source = {
+			[Symbol.asyncIterator]() {
+				return this;
+			},
+			async next() {
+				nextCalls++;
+				return nextCalls === 1 ? {value: 1, done: false} : pendingNext;
+			},
+			return() {
+				returnCalls++;
+				return {done: true};
+			},
+		};
+		const mapped = [];
+		const iterator = pMapIterable(source, value => {
+			mapped.push(value);
+			return value;
+		}, {concurrency: 1})[Symbol.asyncIterator]();
+
+		await iterator.next();
+		await iterator.return();
+		const error = new Error('abandoned input failed');
+		if (outcome === 'next rejection') {
+			rejectNext(error);
+		} else {
+			resolveNext({value: outcome === 'value' ? 2 : Promise.reject(error), done: false});
+		}
+
+		await delay(0);
+		t.deepEqual(mapped, [1]);
+		t.is(nextCalls, 2);
+		t.is(returnCalls, 1);
+	});
+}
+
+test('pMapIterable - cleanup does not wait for an in-flight mapper', async t => {
+	let rejectMapper;
+	const pendingMapper = new Promise((resolve, reject) => {
+		rejectMapper = reject;
+	});
+	let closed = false;
+	function * source() {
+		try {
+			yield 1;
+			yield 2;
+			yield 3;
+		} finally {
+			closed = true;
+		}
+	}
+
+	const iterator = pMapIterable(source(), value => value === 1 ? value : pendingMapper, {concurrency: 2})[Symbol.asyncIterator]();
+	await iterator.next();
+	await iterator.return();
+	t.true(closed);
+	rejectMapper(new Error('abandoned mapper failed'));
+	await delay(0);
+});
+
+test('pMapIterable - cleanup preserves a source rejection with undefined', async t => {
+	let closed = false;
+	const source = {
+		[Symbol.asyncIterator]() {
+			return this;
+		},
+		next() {
+			return Promise.reject();
+		},
+		return() {
+			closed = true;
+			throw new Error('cleanup failed');
+		},
+	};
+	const iterator = pMapIterable(source, value => value)[Symbol.asyncIterator]();
+	let rejected = false;
+	try {
+		await iterator.next();
+	} catch (error) {
+		rejected = true;
+		t.is(error, undefined);
+	}
+
+	t.true(rejected);
+	t.true(closed);
+});
+
+test('pMapIterable - cleanup preserves an error thrown into the output iterator', async t => {
+	const consumerError = new Error('consumer failed');
+	let closed = false;
+	function * source() {
+		try {
+			yield 1;
+			yield 2;
+			yield 3;
+		} finally {
+			closed = true;
+			throw new Error('cleanup failed'); // eslint-disable-line no-unsafe-finally
+		}
+	}
+
+	const iterator = pMapIterable(source(), value => value, {concurrency: 1})[Symbol.asyncIterator]();
+	await iterator.next();
+	await t.throwsAsync(iterator.throw(consumerError), {is: consumerError});
+	t.true(closed);
+});
+
+test('pMapIterable - cleanup does not call return after source exhaustion', async t => {
+	const source = [1, 2][Symbol.iterator]();
+	source.return = () => {
+		t.fail('An exhausted source does not need closing');
+	};
+
+	t.deepEqual(await collectAsyncIterable(pMapIterable(source, value => value, {concurrency: 1})), [1, 2]);
+});
+
+test('pMapIterable - cleanup supports a source without return', async t => {
+	const iterator = pMapIterable([1, 2, 3], value => value, {concurrency: 1})[Symbol.asyncIterator]();
+	await iterator.next();
+	t.deepEqual(await iterator.return(), {done: true, value: undefined});
+});
+
+for (const asyncSource of [false, true]) {
+	const sourceType = asyncSource ? 'async' : 'sync';
+	const iteratorSymbol = asyncSource ? Symbol.asyncIterator : Symbol.iterator;
+	const createIterator = returnMethod => pMapIterable({
+		[iteratorSymbol]() {
+			return this;
+		},
+		next() {
+			return {value: 1, done: false};
+		},
+		return: returnMethod,
+	}, value => value, {concurrency: 1})[Symbol.asyncIterator]();
+
+	test(`pMapIterable - cleanup handles a thenable return result (${sourceType} source)`, async t => {
+		const error = new Error('return result was awaited');
+		const iterator = createIterator(() => ({
+			done: true,
+			value: undefined,
+			// Exercise a valid sync result object that must not be awaited.
+			// eslint-disable-next-line unicorn/no-thenable
+			then() {
+				throw error;
+			},
+		}));
+		await iterator.next();
+
+		if (asyncSource) {
+			await t.throwsAsync(iterator.return(), {is: error});
+		} else {
+			await iterator.return();
+			t.pass();
+		}
+	});
+
+	test(`pMapIterable - cleanup reads done only for a sync return result (${sourceType} source)`, async t => {
+		const error = new Error('done getter failed');
+		const iterator = createIterator(() => ({
+			get done() {
+				throw error;
+			},
+			get value() {
+				throw new Error('value should not be read after done throws or for an async result');
+			},
+		}));
+		await iterator.next();
+
+		if (asyncSource) {
+			await iterator.return();
+			t.pass();
+		} else {
+			await t.throwsAsync(iterator.return(), {is: error});
+		}
+	});
+
+	for (const result of [undefined, null, 0]) {
+		test(`pMapIterable - cleanup rejects a non-object return result (${sourceType} source, ${result})`, async t => {
+			const iterator = createIterator(() => result);
+			await iterator.next();
+			await t.throwsAsync(iterator.return(), {instanceOf: TypeError});
+		});
+	}
+
+	test(`pMapIterable - cleanup accepts a function return result (${sourceType} source)`, async t => {
+		const iterator = createIterator(() => () => {});
+		await iterator.next();
+		await iterator.return();
+		t.pass();
+	});
+
+	test(`pMapIterable - cleanup accepts a null return method (${sourceType} source)`, async t => {
+		const iterator = createIterator(null);
+		await iterator.next();
+		await iterator.return();
+		t.pass();
+	});
+}
+
 test('pMapIterable - iterable that throws', async t => {
 	let isFirstNextCall = true;
 

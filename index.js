@@ -201,12 +201,37 @@ export function pMapIterable(
 
 	return {
 		async * [Symbol.asyncIterator]() {
-			const iterator = iterable[Symbol.asyncIterator] === undefined ? iterable[Symbol.iterator]() : iterable[Symbol.asyncIterator]();
+			const isSyncIterable = iterable[Symbol.asyncIterator] === undefined;
+			const iterator = isSyncIterable ? iterable[Symbol.iterator]() : iterable[Symbol.asyncIterator]();
 
 			const promises = [];
 			let pendingPromisesCount = 0;
 			let isDone = false;
+			let isIterableDone = false;
+			let isClosed = false;
 			let index = 0;
+
+			async function closeIterator() {
+				const returnMethod = iterator.return;
+				if (returnMethod === undefined || returnMethod === null) {
+					return;
+				}
+
+				let result = Reflect.apply(returnMethod, iterator, []);
+				if (!isSyncIterable) {
+					result = await result;
+				}
+
+				if (result === null || (typeof result !== 'object' && typeof result !== 'function')) {
+					throw new TypeError('Iterator return result must be an object');
+				}
+
+				if (isSyncIterable) {
+					// Async-from-sync iteration reads done before awaiting value.
+					Reflect.get(result, 'done');
+					await result.value;
+				}
+			}
 
 			function trySpawn() {
 				if (isDone || !(pendingPromisesCount < concurrency && promises.length < backpressure)) {
@@ -223,6 +248,7 @@ export function pMapIterable(
 
 						if (done) {
 							pendingPromisesCount--;
+							isIterableDone = true;
 							return {done: true};
 						}
 
@@ -230,7 +256,13 @@ export function pMapIterable(
 						trySpawn();
 
 						const currentIndex = index++;
-						const returnValue = await mapper(await value, currentIndex);
+						const element = await value;
+						if (isClosed) {
+							pendingPromisesCount--;
+							return {done: true};
+						}
+
+						const returnValue = await mapper(element, currentIndex);
 
 						pendingPromisesCount--;
 
@@ -256,30 +288,50 @@ export function pMapIterable(
 				promises.push(promise);
 			}
 
-			trySpawn();
-
-			while (promises.length > 0) {
-				const result = await promises[0]; // eslint-disable-line no-await-in-loop
-				const {done, value} = result;
-
-				promises.shift();
-
-				if (Object.hasOwn(result, 'error')) {
-					throw result.error;
-				}
-
-				if (done) {
-					return;
-				}
-
-				// Spawn if just dropped below backpressure limit and below the concurrency limit
+			let hasError = false;
+			try {
 				trySpawn();
 
-				if (value === pMapSkip) {
-					continue;
-				}
+				while (promises.length > 0) {
+					const result = await promises[0]; // eslint-disable-line no-await-in-loop
+					const {done, value} = result;
 
-				yield value;
+					promises.shift();
+
+					if (Object.hasOwn(result, 'error')) {
+						throw result.error;
+					}
+
+					if (done) {
+						return;
+					}
+
+					// Spawn if just dropped below backpressure limit and below the concurrency limit
+					trySpawn();
+
+					if (value === pMapSkip) {
+						continue;
+					}
+
+					yield value;
+				}
+			} catch (error) {
+				hasError = true;
+				throw error;
+			} finally {
+				isDone = true;
+				isClosed = true;
+
+				if (!isIterableDone) {
+					try {
+						await closeIterator();
+					} catch (error) {
+						// Preserve the original failure if closing the source also fails.
+						if (!hasError) {
+							throw error; // eslint-disable-line no-unsafe-finally
+						}
+					}
+				}
 			}
 		},
 	};
